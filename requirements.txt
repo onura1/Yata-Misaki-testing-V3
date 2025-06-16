@@ -1,0 +1,16 @@
+# Discord botu ve altyapısı için temel paketler
+discord.py[voice]>=2.3.2
+aiohttp>=3.8.6
+async-timeout>=4.0.2
+python-dotenv>=1.0.0
+
+# Veritabanı (PostgreSQL) için
+asyncpg>=0.28.0
+
+# Web framework (eğer kullanıyorsanız)
+Flask>=2.0.0
+
+# Müzik çalma işlevselliği için eklenenler
+spotipy
+yt-dlp
+PyNaCl
