@@ -6,16 +6,17 @@ import os
 import yt_dlp
 import asyncio
 from collections import deque
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Union # Union eklendi
 import re
+import shutil # YENİ: Sistem komutlarını kontrol etmek için eklendi
 
 # --- Logger Ayarları ---
 log = logging.getLogger(__name__)
 
 # --- Sabitler ve Ayarlar ---
-# YENİ EKLENDİ: İşletim sistemine göre .exe uzantısını otomatik ekler.
-FFMPEG_PATH_BASE = "./bin/ffmpeg"
-FFMPEG_PATH = FFMPEG_PATH_BASE + ".exe" if os.name == 'nt' else FFMPEG_PATH_BASE
+# DÜZELTİLDİ: FFmpeg yolu artık sabit bir klasör değil, doğrudan sistem komutunun adıdır.
+# Railway'deki nixpacks.toml kurulumu sayesinde bu komut sistemde bulunacaktır.
+FFMPEG_PATH = "ffmpeg"
 
 YTDL_FORMAT_OPTIONS = {
     'format': 'bestaudio/best',
@@ -104,8 +105,9 @@ class PlayerControls(discord.ui.View):
 
     @discord.ui.button(label="Sırayı Göster", style=discord.ButtonStyle.grey, emoji="📜")
     async def queue(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # queue komutunu çağırmak ve etkileşimi yanıtlamak için
         await self.music_cog.queue.callback(self.music_cog, self.ctx)
-        await interaction.response.defer() # Sadece mesajı göstermesi için defer yeterli
+        await interaction.response.defer()
 
 
 class MusicCog(commands.Cog, name="Müzik"):
@@ -115,19 +117,15 @@ class MusicCog(commands.Cog, name="Müzik"):
         self.queues: Dict[int, MusicQueue] = {}
         self.play_locks: Dict[int, asyncio.Lock] = {}
 
-        # --- YENİ EKLENDİ: Gelişmiş Hata Ayıklama Logları ---
-        log.info("--- Müzik Cog Başlatılıyor: Hata Ayıklama Bilgileri ---")
-        log.info(f"Botun çalıştığı ana dizin (CWD): {os.getcwd()}")
-        log.info(f"Kontrol edilen FFmpeg yolu: {FFMPEG_PATH}")
-        abs_path = os.path.abspath(FFMPEG_PATH)
-        log.info(f"Aranan FFmpeg dosyasının tam (mutlak) yolu: {abs_path}")
-
-        if not os.path.exists(FFMPEG_PATH):
-            log.critical(f"KRİTİK HATA: FFmpeg dosyası belirtilen mutlak yolda bulunamadı!")
-            log.critical("Lütfen yukarıdaki 'ana dizin' yolunun projenizin ana klasörü olduğundan emin olun.")
-            log.critical("Eğer değilse, botu projenin ana klasöründeyken 'python main.py' komutuyla başlatın.")
+        # DÜZELTİLDİ: FFmpeg'in varlığını kontrol etme yöntemi değiştirildi.
+        log.info("--- Müzik Cog Başlatılıyor: FFmpeg Kontrolü ---")
+        if not shutil.which(FFMPEG_PATH):
+            log.critical(f"KRİTİK HATA: FFmpeg komutu ('{FFMPEG_PATH}') sistemde bulunamadı veya çalıştırılabilir değil.")
+            log.critical("Bu, Railway üzerinde FFmpeg'in kurulumunda bir sorun olduğu anlamına gelebilir. nixpacks.toml dosyasını kontrol edin.")
+            # Bu durum cog'un yüklenmesini engeller (setup fonksiyonundaki kontrol nedeniyle)
         else:
-            log.info(f"FFmpeg dosyası '{abs_path}' yolunda başarıyla bulundu.")
+            found_path = shutil.which(FFMPEG_PATH)
+            log.info(f"FFmpeg komutu ('{FFMPEG_PATH}') sistemde başarıyla bulundu. Tam yolu: {found_path}")
         log.info("----------------------------------------------------")
 
 
@@ -140,7 +138,7 @@ class MusicCog(commands.Cog, name="Müzik"):
         if guild_id not in self.play_locks:
             self.play_locks[guild_id] = asyncio.Lock()
         return self.play_locks[guild_id]
-    
+
     async def _cleanup(self, guild_id: int):
         """Sunucudan ayrılırken kaynakları temizler."""
         if guild_id in self.queues:
@@ -153,9 +151,10 @@ class MusicCog(commands.Cog, name="Müzik"):
         """Kuyruktaki bir sonraki şarkıyı çalar. Bu fonksiyon, sistemin kalbidir."""
         guild_id = ctx.guild.id
         queue = self.get_queue(guild_id)
-        
+
         async with self.get_lock(guild_id):
             if ctx.voice_client is None or not ctx.voice_client.is_connected():
+                log.warning(f"{guild_id}: _play_next çağrıldı ama ses istemcisi bağlı değil. Temizlik yapılıyor.")
                 return await self._cleanup(guild_id)
 
             next_song: Optional[Song] = None
@@ -169,16 +168,25 @@ class MusicCog(commands.Cog, name="Müzik"):
                 await ctx.send("📜 Kuyruk bitti. 1 dakika içinde kanaldan ayrılacağım.", delete_after=30)
                 await asyncio.sleep(60)
                 if ctx.voice_client and not ctx.voice_client.is_playing():
-                     await ctx.voice_client.disconnect()
+                    await ctx.voice_client.disconnect()
+                    await self._cleanup(guild_id) # Temizlik burada da çağrılmalı
                 return
 
             queue.current_song = next_song
-            source = PCMVolumeTransformer(FFmpegPCMAudio(next_song.source_url, executable=FFMPEG_PATH, **FFMPEG_OPTIONS), volume=queue.volume)
             
+            # DÜZELTİLDİ: executable=FFMPEG_PATH artık doğru şekilde "ffmpeg" komutunu kullanacak.
+            try:
+                source = PCMVolumeTransformer(FFmpegPCMAudio(next_song.source_url, executable=FFMPEG_PATH, **FFMPEG_OPTIONS), volume=queue.volume)
+            except Exception as e:
+                log.error(f"FFmpegPCMAudio oluşturulurken hata oluştu: {e}", exc_info=True)
+                await ctx.send(f"⚠️ **{next_song.title}** çalınırken bir kaynak hatası oluştu. Şarkı atlanıyor.")
+                # Hata durumunda bir sonraki şarkıya geç
+                return await self._play_next(ctx)
+                
             def after_playing(error):
                 if error:
-                    log.error(f"Şarkı çalınırken hata: {error}", exc_info=True)
-                # Yarış durumu oluşturmamak için bot'un event loop'unda güvenli bir şekilde çalıştır.
+                    log.error(f"Şarkı çalındıktan sonra hata: {error}", exc_info=True)
+                # Yarış durumu (race condition) oluşturmamak için bot'un event loop'unda güvenli bir şekilde çalıştır.
                 self.bot.loop.create_task(self._play_next(ctx))
 
             ctx.voice_client.play(source, after=after_playing)
@@ -192,7 +200,7 @@ class MusicCog(commands.Cog, name="Müzik"):
             embed.add_field(name="İsteyen", value=next_song.requester.mention)
             if next_song.thumbnail:
                 embed.set_thumbnail(url=next_song.thumbnail)
-            
+
             await ctx.send(embed=embed, view=PlayerControls(self, ctx))
 
     @commands.command(name='çal', aliases=['p', 'play'], help="Bir şarkıyı çalar veya sıraya ekler.")
@@ -205,34 +213,55 @@ class MusicCog(commands.Cog, name="Müzik"):
         if ctx.voice_client and ctx.voice_client.channel != voice_channel:
             await ctx.voice_client.move_to(voice_channel)
         elif not ctx.voice_client:
-            await voice_channel.connect()
+            try:
+                await voice_channel.connect()
+            except asyncio.TimeoutError:
+                return await ctx.send("Ses kanalına bağlanırken zaman aşımı oluştu. Lütfen tekrar deneyin.")
+            except Exception as e:
+                log.error(f"Ses kanalına bağlanırken hata: {e}", exc_info=True)
+                return await ctx.send("Ses kanalına bağlanırken bir hata oluştu.")
+
 
         try:
+            # Arama mesajını gönder
+            processing_msg = await ctx.send(f"🔎 **`{query}`** aranıyor, lütfen bekleyin...")
+
             loop = self.bot.loop or asyncio.get_event_loop()
             data = await loop.run_in_executor(None, lambda: ytdl.extract_info(query, download=False))
             
             if 'entries' in data: # Bu bir çalma listesi
                 song_list = data['entries']
-                await ctx.send(f"✅ **{len(song_list)}** şarkılık bir çalma listesi bulundu ve sıraya ekleniyor...")
+                # Mesajı güncelle
+                await processing_msg.edit(content=f"✅ **{len(song_list)}** şarkılık bir çalma listesi bulundu ve sıraya ekleniyor...")
             else: # Tek bir şarkı
                 song_list = [data]
+                # Mesajı sil (çünkü aşağıda embed gönderilecek)
+                await processing_msg.delete()
 
             queue = self.get_queue(ctx.guild.id)
+            songs_added = 0
             for entry in song_list:
-                song = Song(entry, ctx.author)
-                queue.add(song)
-            
-            if len(song_list) == 1:
+                if entry: # Bazen listede None elemanlar olabilir
+                    song = Song(entry, ctx.author)
+                    queue.add(song)
+                    songs_added += 1
+
+            if songs_added == 0:
+                 return await ctx.send(f"⚠️ `{query}` aramasından geçerli bir şarkı bulunamadı.")
+
+
+            if len(song_list) == 1 and songs_added > 0:
                 await ctx.send(embed=discord.Embed(
                     description=f"✅ **Sıraya Eklendi:** [{song_list[0]['title']}]({song_list[0]['webpage_url']})",
                     color=discord.Color.green()
                 ))
 
         except Exception as e:
+            await processing_msg.edit(content=f"⚠️ `{query}` aranırken bir hata oluştu. Lütfen tekrar deneyin.")
             log.error(f"Şarkı alınırken hata: {e}", exc_info=True)
-            return await ctx.send(f"⚠️ `{query}` aranırken bir hata oluştu. Lütfen tekrar deneyin.")
+            return
 
-        if not ctx.voice_client.is_playing():
+        if ctx.voice_client and not ctx.voice_client.is_playing():
             await self._play_next(ctx)
             
     @commands.command(name='atla', aliases=['s', 'skip'], help="Mevcut şarkıyı atlar.")
@@ -270,7 +299,7 @@ class MusicCog(commands.Cog, name="Müzik"):
         
         if not queue.is_empty:
             song_list_str = ""
-            for i, song in enumerate(queue.queue_list[:10]):
+            for i, song in enumerate(queue.queue_list[:10]): # Sadece ilk 10 şarkıyı göster
                 song_list_str += f"`{i+1}.` **{song.title}** | `{song.format_duration()}`\n"
             
             if len(queue.queue_list) > 10:
@@ -287,7 +316,7 @@ class MusicCog(commands.Cog, name="Müzik"):
         status = "açıldı" if queue.loop else "kapatıldı"
         await ctx.send(f"🔁 Döngü **{status}**.")
     
-    @commands.command(name='ses', aliases=['v', 'volume'], help="Botun ses seviyesini ayarlar (1-150).")
+    @commands.command(name='ses', aliases=['v', 'volume'], help="Botun ses seviyesini ayarlar (0-150).")
     async def volume(self, ctx: commands.Context, level: int):
         if not ctx.voice_client or not ctx.voice_client.is_connected():
             return await ctx.send(" Bot bir ses kanalında değil.")
@@ -316,7 +345,7 @@ class MusicCog(commands.Cog, name="Müzik"):
         embed.add_field(name="İsteyen", value=queue.current_song.requester.mention)
         if queue.current_song.thumbnail:
             embed.set_thumbnail(url=queue.current_song.thumbnail)
-        await ctx.send(embed=embed)
+        await ctx.send(embed=embed, view=PlayerControls(self, ctx))
         
     @commands.command(name='temizle', aliases=['clear'], help="Şarkı sırasını temizler.")
     async def clear(self, ctx: commands.Context):
@@ -326,9 +355,9 @@ class MusicCog(commands.Cog, name="Müzik"):
 
 
 async def setup(bot: commands.Bot):
-    # Cog'u eklemeden önce FFmpeg dosyasının varlığını kontrol edelim
-    if not os.path.exists(FFMPEG_PATH):
-        # Hata ayıklama logları __init__ içine taşındığı için bu kontrol sade kalabilir.
-        log.critical(f"Müzik Cog'u yüklenemedi çünkü FFmpeg '{FFMPEG_PATH}' yolunda bulunamadı.")
-        return
+    # DÜZELTİLDİ: Cog'u eklemeden önce FFmpeg komutunun sistemde varlığını kontrol et
+    if not shutil.which(FFMPEG_PATH):
+        log.critical(f"Müzik Cog'u yüklenemedi çünkü FFmpeg komutu ('{FFMPEG_PATH}') sistemde bulunamadı veya çalıştırılamıyor.")
+        return # Cog'un yüklenmesini engelle
     await bot.add_cog(MusicCog(bot))
+    log.info("Music Cog (Müzik Sistemi) başarıyla yüklendi!")
