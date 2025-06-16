@@ -14,3 +14,4 @@ Flask>=2.0.0
 spotipy
 yt-dlp
 PyNaCl
+ffmpeg-python==0.2.0
