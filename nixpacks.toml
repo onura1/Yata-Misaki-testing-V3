@@ -1,18 +1,25 @@
-# nixpacks.toml
-
-# Build işlemi için kullanılacak ortam değişkenleri.
-# Buradan Python sürümünü doğru bir şekilde belirtebiliriz.
+# Environment variables for the build process
 [variables]
 NIXPACKS_PYTHON_VERSION = "3.11"
 
-# Ortama kurulacak ek sistem kütüphaneleri (FFmpeg gibi).
+# Install system dependencies (e.g., ffmpeg)
 [apt]
-pkgs = ["ffmpeg"]
+pkgs = ["ffmpeg", "python3", "python3-pip", "python3-dev"]
 
-# Python kütüphanelerini requirements.txt'den kurar.
+# Setup phase to ensure Python and pip are installed
+[phases.setup]
+dependsOn = []
+cmds = [
+  "apt-get update",
+  "apt-get install -y python3 python3-pip python3-dev",
+  "pip3 install --upgrade pip"
+]
+
+# Install phase for Python dependencies
 [phases.install]
-cmds = ["pip install -r requirements.txt"]
+dependsOn = ["setup"]
+cmds = ["pip3 install -r requirements.txt"]
 
-# Botu başlatacak komut.
+# Start command for the application
 [start]
-cmd = "python main.py"
+cmd = "python3 main.py"
