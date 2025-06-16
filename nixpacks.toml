@@ -1,2 +1,22 @@
-[phases.setup]
-aptPkgs = ["ffmpeg"]
+# nixpacks.toml
+
+# --- Sağlayıcılar (Providers) ---
+# Projenin kullanacağı programlama dili ve sürümünü belirtir.
+[providers]
+python = "3.11" # veya "3.10", "3.12" gibi projenize uygun bir sürüm
+
+# --- Sistem Paketleri (System Packages) ---
+# Ortama kurulacak ek sistem programları.
+# FFmpeg, ses/müzik işlevselliği için gereklidir.
+[apt]
+pkgs = ["ffmpeg"]
+
+# --- Kurulum Aşaması (Build Phase) ---
+# Python kütüphanelerini kurar.
+[phases.install]
+cmds = ["pip install -r requirements.txt"]
+
+# --- Başlatma Aşaması (Start Phase) ---
+# Botu başlatacak komut.
+[start]
+cmd = "python main.py"
