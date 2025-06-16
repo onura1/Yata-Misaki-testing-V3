@@ -7,10 +7,10 @@ python-dotenv>=1.0.0
 # Veritabanı (PostgreSQL) için
 asyncpg>=0.28.0
 
-# Web framework (eğer kullanıyorsanız)
+# Web framework (keep-alive için)
 Flask>=2.0.0
 
-# Müzik çalma işlevselliği için eklenenler
+# Müzik çalma işlevselliği için
 spotipy
 yt-dlp
 PyNaCl
