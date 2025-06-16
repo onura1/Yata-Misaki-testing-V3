@@ -1,18 +1,18 @@
 # nixpacks.toml
 
-# --- Sağlayıcılar (Providers) ---
-# Projenin kullanacağı programlama dili ve sürümünü belirtir.
-[providers]
-python = "3.11" # veya "3.10", "3.12" gibi projenize uygun bir sürüm
+# --- Ortam Değişkenleri (Environment Variables) ---
+# Build işlemi için kullanılacak ortam değişkenleri.
+# Buradan Python sürümünü doğru bir şekilde belirtebiliriz.
+[variables]
+NIXPACKS_PYTHON_VERSION = "3.11"
 
 # --- Sistem Paketleri (System Packages) ---
-# Ortama kurulacak ek sistem programları.
-# FFmpeg, ses/müzik işlevselliği için gereklidir.
+# Ortama kurulacak ek sistem kütüphaneleri (FFmpeg gibi).
 [apt]
 pkgs = ["ffmpeg"]
 
 # --- Kurulum Aşaması (Build Phase) ---
-# Python kütüphanelerini kurar.
+# Python kütüphanelerini requirements.txt'den kurar.
 [phases.install]
 cmds = ["pip install -r requirements.txt"]
 
