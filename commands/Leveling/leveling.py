@@ -418,21 +418,7 @@ class LevelingCog(commands.Cog):
         else:
             await ctx.send(f"❌ {channel.mention} zaten XP kara listesinde!")
 
-    @commands.command(name="kapat")
-    @commands.is_owner()
-    async def shutdown(self, ctx: commands.Context):
-        """Botu güvenli bir şekilde kapatır (Sadece sahip kullanabilir)."""
-        await ctx.send("🔴 Bot kapatılıyor...")
-        self.logger.info("Bot sahibi tarafından kapatıldı.")
-        await self.bot.close()
-
-    @commands.command(name="restart")
-    @commands.is_owner()
-    async def restart(self, ctx: commands.Context):
-        """Botu yeniden başlatır (Sadece sahip kullanabilir)."""
-        await ctx.send("🔄 Bot yeniden başlatılıyor...")
-        self.logger.info("Bot sahibi tarafından yeniden başlatıldı.")
-        await self.bot.close()  # Botu kapat, ana script yeniden başlatabilir
+    # Bot sahibi komutları Owner cogunda bulunduğundan burada tekrarlanmıyor
 
     @commands.command(name="seviyesifirla")
     @commands.has_permissions(manage_guild=True)
@@ -451,17 +437,7 @@ class LevelingCog(commands.Cog):
             self.logger.error(f"Seviye sıfırlama hatası (K:{member.id}, S:{ctx.guild.id}): {e}")
             await ctx.send("⚠️ Seviye sıfırlama başarısız oldu!")
 
-    @commands.command(name="uptime")
-    @commands.is_owner()
-    async def uptime(self, ctx: commands.Context):
-        """Botun ne kadar süredir aktif olduğunu gösterir (Sadece Sahip)."""
-        uptime_seconds = discord.utils.utcnow().timestamp() - self.bot.start_time
-        days, remainder = divmod(int(uptime_seconds), 86400)
-        hours, remainder = divmod(remainder, 3600)
-        minutes, seconds = divmod(remainder, 60)
-        uptime_str = f"{days} gün, {hours} saat, {minutes} dakika, {seconds} saniye"
-        await ctx.send(f"🕒 Bot {uptime_str} süredir aktif!")
-        self.logger.info(f"Uptime komutu kullanıldı: {uptime_str}")
+    # Uptime komutu Owner cogunda bulunduğundan burada tanımlı değil
 
     @commands.command(name="xpayar")
     @commands.has_permissions(manage_guild=True)
