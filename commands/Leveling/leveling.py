@@ -3,12 +3,13 @@ import json
 import logging
 import os
 import random
-from typing import Tuple
-import discord
-from discord.ext import commands
-import asyncpg
+from typing import Dict, Tuple
 
-# Loglama ayarları
+import asyncpg
+import discord
+from discord.ext import commands, tasks
+
+# --- Loglama Ayarları ---
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s:%(levelname)s:%(name)s: %(message)s',
@@ -18,33 +19,44 @@ logging.basicConfig(
     ]
 )
 
+# --- Yapılandırma ---
 CONFIG_FILE = "leveling_config.json"
 DEFAULT_CONFIG = {
-    "xp_range": {"min": 5, "max": 10},  # XP aralığı düşürüldü
+    "xp_range": {"min": 5, "max": 10},
     "xp_cooldown_seconds": 60,
     "level_roles": {},
     "blacklisted_channels": [],
     "xp_boosts": {},
-    "congratulations_channel_id": None  # Tebrik mesajı için kanal ID'si
+    "congratulations_channel_id": None,
+    "stack_roles": False # Yeni ayar: Rollerin yığılıp yığılmayacağı
 }
 
 class LevelingCog(commands.Cog):
+    """Veritabanı ve komut yapısı geliştirilmiş seviye sistemi."""
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.logger = logging.getLogger(__name__)
         self.config = DEFAULT_CONFIG.copy()
         self._load_config()
+        
         self.cooldowns = {}
         self.db_pool = None
+        
+        # --- PERFORMANS GELİŞTİRMESİ: XP Önbelleği ---
+        # Her mesajda DB'ye yazmak yerine XP'yi burada biriktiririz.
+        self.xp_cache: Dict[int, Dict[int, int]] = {} # guild_id -> {user_id: xp_to_add}
+        
         self.bot.loop.create_task(self._init_db())
+        self.flush_xp_cache_to_db.start() # Arka plan görevini başlat
 
     async def _init_db(self):
-        """PostgreSQL veritabanına bağlan ve tabloyu oluştur."""
+        """PostgreSQL veritabanına bağlanır ve gerekli tabloları oluşturur."""
         try:
             database_url = os.getenv("DATABASE_URL")
             if not database_url:
-                self.logger.error("DATABASE_URL çevresel değişkeni tanımlı değil.")
+                self.logger.critical("DATABASE_URL çevresel değişkeni tanımlı değil. Bot başlatılamıyor.")
                 raise ValueError("DATABASE_URL çevresel değişkeni eksik.")
+            
             self.db_pool = await asyncpg.create_pool(database_url)
             async with self.db_pool.acquire() as conn:
                 await conn.execute("""
@@ -57,465 +69,314 @@ class LevelingCog(commands.Cog):
                         PRIMARY KEY (user_id, guild_id)
                     )
                 """)
-                await conn.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_total_xp ON users (total_xp DESC)
-                """)
-                self.logger.info("PostgreSQL veritabanı başlatıldı.")
-        except asyncpg.exceptions.PostgresSyntaxError as e:
-            self.logger.error(f"SQL sentaks hatası: {e}")
-            raise
-        except asyncpg.exceptions.InvalidCatalogNameError:
-            self.logger.error("Geçersiz veritabanı adı. DATABASE_URL kontrol edin.")
-            raise
-        except asyncpg.exceptions.ConnectionDoesNotExistError:
-            self.logger.error("Veritabanına bağlantı kurulamadı. DATABASE_URL veya ağ ayarlarını kontrol edin.")
-            raise
+            self.logger.info("PostgreSQL veritabanı bağlantısı başarılı.")
         except Exception as e:
-            self.logger.error(f"Veritabanı başlatma hatası: {type(e).__name__}: {e}")
+            self.logger.critical(f"Veritabanı başlatılamadı: {e}")
             raise
 
     def _load_config(self):
-        """Yapılandırma dosyasını yükle."""
         try:
             if os.path.exists(CONFIG_FILE):
                 with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
                     loaded_config = json.load(f)
-                    if not isinstance(loaded_config, dict):
-                        raise ValueError("Yapılandırma dosyası bir JSON nesnesi olmalı.")
-                    for key in DEFAULT_CONFIG:
-                        if key not in loaded_config:
-                            self.logger.warning(f"'{key}' yapılandırmada eksik, varsayılan değer kullanılıyor.")
-                            loaded_config[key] = DEFAULT_CONFIG[key]
-                    if not isinstance(loaded_config["xp_range"], dict) or \
-                       not all(k in loaded_config["xp_range"] for k in ["min", "max"]) or \
-                       not all(isinstance(v, int) and v > 0 for v in loaded_config["xp_range"].values()):
-                        self.logger.warning("Geçersiz 'xp_range', varsayılan değer kullanılıyor.")
-                        loaded_config["xp_range"] = DEFAULT_CONFIG["xp_range"]
-                    self.config.update(loaded_config)
-                    self.logger.info(f"Yapılandırma yüklendi: {CONFIG_FILE}")
+                    for key, value in DEFAULT_CONFIG.items():
+                        loaded_config.setdefault(key, value)
+                    self.config = loaded_config
+                self.logger.info(f"Yapılandırma dosyası ({CONFIG_FILE}) başarıyla yüklendi.")
             else:
-                self.config = DEFAULT_CONFIG.copy()
                 self._save_config()
-                self.logger.info(f"Yapılandırma oluşturuldu: {CONFIG_FILE}")
+                self.logger.info(f"Varsayılan yapılandırma dosyası ({CONFIG_FILE}) oluşturuldu.")
         except Exception as e:
-            self.logger.error(f"Yapılandırma yüklenirken hata: {e}. Varsayılan yapılandırma kullanılıyor.")
+            self.logger.error(f"Yapılandırma yüklenirken hata: {e}. Varsayılan ayarlar kullanılıyor.")
             self.config = DEFAULT_CONFIG.copy()
-            self._save_config()
 
     def _save_config(self):
-        """Yapılandırmayı dosyaya kaydet."""
         try:
             with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
                 json.dump(self.config, f, indent=4, ensure_ascii=False)
-            self.logger.info(f"Yapılandırma kaydedildi: {CONFIG_FILE}")
+            self.logger.info(f"Yapılandırma {CONFIG_FILE} dosyasına kaydedildi.")
         except Exception as e:
             self.logger.error(f"Yapılandırma kaydedilemedi: {e}")
-
-    async def _get_user_data(self, guild_id: int, user_id: int) -> Tuple[int, int, int]:
-        """Kullanıcı verilerini PostgreSQL'den al."""
-        try:
-            async with self.db_pool.acquire() as conn:
-                result = await conn.fetchrow(
-                    "SELECT level, xp, total_xp FROM users WHERE user_id = $1 AND guild_id = $2",
-                    user_id, guild_id
-                )
-                if result and None not in result:
-                    return (result['level'], result['xp'], result['total_xp'])
-                else:
-                    self.logger.info(f"Kullanıcı DB'de bulunamadı/eksik, sıfırlanıyor (K:{user_id}, S:{guild_id})")
-                    await conn.execute(
-                        "INSERT INTO users (user_id, guild_id, level, xp, total_xp) VALUES ($1, $2, 0, 0, 0)",
-                        user_id, guild_id
-                    )
-                    return (0, 0, 0)
-        except Exception as e:
-            self.logger.error(f"Veri alma hatası (K:{user_id}, S:{guild_id}): {e}")
-            return (0, 0, 0)
-
-    async def _update_user_xp(self, guild_id: int, user_id: int, xp_to_add: int, boost: float = 1.0, message: discord.Message = None):
-        """Kullanıcı XP'sini güncelle ve seviye atlamasını kontrol et."""
-        boosted_xp = int(xp_to_add * boost)
-        level, current_xp, total_xp = await self._get_user_data(guild_id, user_id)
-        total_xp += boosted_xp
-        current_xp += boosted_xp
-        next_level_xp = self._calculate_xp_for_level(level + 1)
-        
-        level_up = False
-        if current_xp >= next_level_xp:
-            level += 1
-            current_xp -= next_level_xp
-            level_up = True
-            self.logger.info(f"Kullanıcı seviye atladı: {user_id} (S:{guild_id}, Seviye: {level})")
-            try:
-                member = self.bot.get_guild(guild_id).get_member(user_id)
-                if member:
-                    await self._update_level_roles(member, guild_id, level)
-                    # Embed ile tebrik mesajı
-                    channel = message.channel if message else discord.utils.get(member.guild.text_channels, name="genel")
-                    if channel and channel.permissions_for(member.guild.me).send_messages:
-                        embed = discord.Embed(
-                            title="🎉 Tebrikler!",
-                            description=f"{member.mention}, seviye {level}'e ulaştın!",
-                            color=discord.Color.gold()
-                        )
-                        embed.add_field(name="Önceki Seviye", value=str(level - 1), inline=True)
-                        embed.add_field(name="Yeni Seviye", value=str(level), inline=True)
-                        embed.set_thumbnail(url=member.avatar.url if member.avatar else None)
-                        embed.set_footer(text=f"Toplam XP: {total_xp}")
-                        await channel.send(embed=embed)
-            except Exception as e:
-                self.logger.error(f"Seviye rolü güncelleme hatası (K:{user_id}, S:{guild_id}): {e}")
-        
-        try:
-            async with self.db_pool.acquire() as conn:
-                await conn.execute(
-                    "INSERT INTO users (user_id, guild_id, level, xp, total_xp) "
-                    "VALUES ($1, $2, $3, $4, $5) "
-                    "ON CONFLICT (user_id, guild_id) DO UPDATE "
-                    "SET level = $3, xp = $4, total_xp = $5",
-                    user_id, guild_id, level, current_xp, total_xp
-                )
-                self.logger.info(f"Kullanıcı XP güncellendi: {user_id} (S:{guild_id}, XP: {current_xp}, Total XP: {total_xp})")
-        except Exception as e:
-            self.logger.error(f"XP güncelleme hatası (K:{user_id}, S:{guild_id}): {e}")
-
+            
     def _calculate_xp_for_level(self, level: int) -> int:
-        """Bir sonraki seviye için gereken XP'yi hesapla."""
-        if level < 0:
-            return 0
-        return 50 * (level ** 2) + (100 * level) + 200  # Daha zor bir seviye sistemi
+        """Belirtilen seviyeye ulaşmak için gereken toplam XP miktarını hesaplar."""
+        return 50 * (level ** 2) + (100 * level) + 200
 
-    async def _update_level_roles(self, member: discord.Member, guild_id: int, level: int):
-        """Seviye rollerini güncelle."""
-        if "level_roles" not in self.config:
-            self.logger.warning("Yapılandırmada 'level_roles' bulunamadı.")
+    @tasks.loop(seconds=60.0)
+    async def flush_xp_cache_to_db(self):
+        """Önbellekte biriken XP'leri periyodik olarak veritabanına yazar."""
+        if not self.xp_cache:
             return
+
+        local_cache = self.xp_cache.copy()
+        self.xp_cache.clear()
         
-        level_role_map = self.config["level_roles"]
+        self.logger.info(f"{len(local_cache)} sunucudan XP verileri veritabanına yazılıyor...")
+
+        async with self.db_pool.acquire() as conn:
+            async with conn.transaction():
+                for guild_id, users in local_cache.items():
+                    guild = self.bot.get_guild(guild_id)
+                    if not guild:
+                        continue
+                        
+                    for user_id, xp_to_add in users.items():
+                        user_data = await conn.fetchrow(
+                            "SELECT level, xp, total_xp FROM users WHERE user_id = $1 AND guild_id = $2",
+                            user_id, guild_id
+                        )
+
+                        if user_data:
+                            level, xp, total_xp = user_data['level'], user_data['xp'], user_data['total_xp']
+                        else:
+                            level, xp, total_xp = 0, 0, 0
+
+                        xp += xp_to_add
+                        total_xp += xp_to_add
+                        
+                        xp_for_next = self._calculate_xp_for_level(level + 1)
+                        level_up = False
+                        while xp >= xp_for_next:
+                            level += 1
+                            xp -= xp_for_next
+                            xp_for_next = self._calculate_xp_for_level(level + 1)
+                            level_up = True
+                        
+                        await conn.execute(
+                            """
+                            INSERT INTO users (user_id, guild_id, level, xp, total_xp)
+                            VALUES ($1, $2, $3, $4, $5)
+                            ON CONFLICT (user_id, guild_id) DO UPDATE
+                            SET level = $3, xp = $4, total_xp = $5
+                            """,
+                            user_id, guild_id, level, xp, total_xp
+                        )
+
+                        if level_up:
+                            member = guild.get_member(user_id)
+                            if member:
+                                self.bot.loop.create_task(self._handle_level_up(member, level, total_xp))
+
+    async def _handle_level_up(self, member: discord.Member, new_level: int, total_xp: int):
+        """Seviye atlama durumunda tebrik mesajı gönderir ve rolleri günceller."""
+        await self._update_level_roles(member, new_level)
+        
+        channel_id = self.config.get("congratulations_channel_id")
+        channel = self.bot.get_channel(channel_id) if channel_id else member.guild.system_channel
+        
+        if channel and channel.permissions_for(member.guild.me).send_messages:
+            embed = discord.Embed(
+                title="🎉 Seviye Atladın!",
+                description=f"Tebrikler {member.mention}, **{new_level}** seviyesine ulaştın!",
+                color=discord.Color.gold()
+            ).set_thumbnail(url=member.display_avatar.url).set_footer(text=f"Yeni Toplam XP: {total_xp}")
+            await channel.send(embed=embed)
+
+    async def _update_level_roles(self, member: discord.Member, level: int):
+        """Kullanıcının seviyesine göre rollerini ekler veya kaldırır."""
+        guild = member.guild
+        level_roles = self.config.get("level_roles", {})
+        stack_roles = self.config.get("stack_roles", False)
+        
         roles_to_add = []
         roles_to_remove = []
-        member_role_ids = {role.id for role in member.roles}
-        bot_member = member.guild.me
+        highest_role_reached = None
 
-        for level_threshold, role_id_str in level_role_map.items():
-            try:
-                level_threshold = int(level_threshold)
-                role_id = int(role_id_str)
-                role = member.guild.get_role(role_id)
-                if not role:
-                    self.logger.warning(f"Rol bulunamadı: {role_id} (S:{guild_id})")
-                    continue
-                if level >= level_threshold and role_id not in member_role_ids:
-                    if role.position < bot_member.top_role.position:
-                        roles_to_add.append(role)
-                    else:
-                        self.logger.warning(f"Rol {role.name} botun en yüksek rolünden yüksek, eklenemez!")
-                elif level < level_threshold and role_id in member_role_ids:
-                    if role.position < bot_member.top_role.position:
-                        roles_to_remove.append(role)
-                    else:
-                        self.logger.warning(f"Rol {role.name} botun en yüksek rolünden yüksek, kaldırılamaz!")
-            except ValueError:
-                self.logger.error(f"Geçersiz seviye/rol ID: {level_threshold}/{role_id_str}")
+        for level_str, role_id_str in sorted(level_roles.items(), key=lambda x: int(x[0])):
+            level_threshold = int(level_str)
+            role_id = int(role_id_str)
+            role = guild.get_role(role_id)
+
+            if not role or role.position >= guild.me.top_role.position:
+                continue
+
+            has_role = role in member.roles
+            
+            if level >= level_threshold:
+                highest_role_reached = role
+                if not has_role:
+                    roles_to_add.append(role)
+            elif has_role:
+                roles_to_remove.append(role)
         
-        try:
-            if roles_to_remove:
-                await member.remove_roles(*roles_to_remove, reason="Seviye düşürüldü veya sıfırlandı")
-                self.logger.info(f"{member.display_name}'dan roller kaldırıldı: {[r.name for r in roles_to_remove]}")
-            if roles_to_add:
-                await member.add_roles(*roles_to_add, reason=f"Seviye {level} ulaşıldı")
-                self.logger.info(f"{member.display_name}'a roller eklendi: {[r.name for r in roles_to_add]}")
-        except discord.Forbidden:
-            self.logger.error(f"{member.display_name} için rol güncelleme izni yok.")
-        except Exception as e:
-            self.logger.error(f"Rol güncelleme hatası: {e}")
+        if not stack_roles and highest_role_reached:
+            for level_str, role_id_str in level_roles.items():
+                role_id = int(role_id_str)
+                role = guild.get_role(role_id)
+                if role and role != highest_role_reached and role in member.roles:
+                    roles_to_remove.append(role)
 
-    async def _correct_member_level_roles(self, member: discord.Member, guild: discord.Guild):
-        """Üyenin seviye rollerini düzelt."""
-        level, _, _ = await self._get_user_data(guild.id, member.id)
-        await self._update_level_roles(member, guild.id, level)
+        if roles_to_add:
+            await member.add_roles(*roles_to_add, reason=f"{level}. seviyeye ulaşıldı.")
+        if roles_to_remove:
+            await member.remove_roles(*roles_to_remove, reason="Seviye rolü güncellendi.")
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        """Mesaj gönderildiğinde XP kazandır."""
-        if message.author.bot or not message.guild or message.channel.id in self.config["blacklisted_channels"]:
+        """Her mesajda XP'yi veritabanı yerine önbelleğe ekler."""
+        if not message.guild or message.author.bot or message.channel.id in self.config.get("blacklisted_channels", []):
             return
-        
+            
         prefix = await self.bot.get_prefix(message)
-        if isinstance(prefix, str):
-            if message.content.startswith(prefix):
-                return
-        else:
-            if any(message.content.startswith(p) for p in prefix):
-                return
-        
+        if message.content.startswith(tuple(prefix) if isinstance(prefix, list) else prefix):
+            return
+
         user_id = message.author.id
         guild_id = message.guild.id
-        current_time = discord.utils.utcnow().timestamp()
+        current_time = asyncio.get_event_loop().time()
+        cooldown = self.config.get("xp_cooldown_seconds", 60)
         
-        if user_id not in self.cooldowns:
-            self.cooldowns[user_id] = 0
-        
-        if current_time - self.cooldowns[user_id] >= self.config["xp_cooldown_seconds"]:
-            xp_to_add = random.randint(self.config["xp_range"]["min"], self.config["xp_range"]["max"])
-            boost = self._get_xp_boost(message.author)
-            await self._update_user_xp(guild_id, user_id, xp_to_add, boost, message)
+        if current_time - self.cooldowns.get(user_id, 0) > cooldown:
             self.cooldowns[user_id] = current_time
+            xp_range = self.config.get("xp_range", {"min": 5, "max": 10})
+            xp_to_add = random.randint(xp_range['min'], xp_range['max'])
+            
+            if guild_id not in self.xp_cache:
+                self.xp_cache[guild_id] = {}
+            if user_id not in self.xp_cache[guild_id]:
+                self.xp_cache[guild_id][user_id] = 0
+            self.xp_cache[guild_id][user_id] += xp_to_add
 
-    @commands.Cog.listener()
-    async def on_member_remove(self, member: discord.Member):
-        """Üye sunucudan çıktığında seviye ve XP verilerini sil."""
-        try:
-            async with self.db_pool.acquire() as conn:
-                await conn.execute(
-                    "DELETE FROM users WHERE user_id = $1 AND guild_id = $2",
-                    member.id, member.guild.id
-                )
-                self.logger.info(f"Üye sunucudan ayrıldı, verileri silindi: {member.display_name} (ID: {member.id}, S: {member.guild.id})")
-        except Exception as e:
-            self.logger.error(f"Üye verileri silinirken hata (K:{member.id}, S:{member.guild.id}): {e}")
-
-    def _get_xp_boost(self, member: discord.Member) -> float:
-        """Kullanıcı veya rol için XP çarpanını al."""
-        if "xp_boosts" not in self.config:
-            return 1.0
-        boost = 1.0
-        boosts = self.config["xp_boosts"]
-        user_boost = boosts.get(str(member.id))
-        if user_boost:
-            try:
-                boost = max(boost, float(user_boost))
-                if boost <= 0:
-                    self.logger.warning(f"Geçersiz XP çarpanı: {user_boost} (K:{member.id})")
-                    boost = 1.0
-            except (ValueError, TypeError):
-                self.logger.error(f"Geçersiz XP çarpanı: {user_boost} (K:{member.id})")
-        for role in member.roles:
-            role_boost = boosts.get(str(role.id))
-            if role_boost:
-                try:
-                    boost = max(boost, float(role_boost))
-                    if boost <= 0:
-                        self.logger.warning(f"Geçersiz rol XP çarpanı: {role_boost} (R:{role.id})")
-                        boost = 1.0
-                except (ValueError, TypeError):
-                    self.logger.error(f"Geçersiz rol XP çarpanı: {role_boost} (R:{role.id})")
-        return boost
-
-    @commands.command(name="seviye")
+    # --- KULLANICI KOMUTLARI ---
+    @commands.command(name="seviye", aliases=["level", "rank"])
     async def level_command(self, ctx: commands.Context, member: discord.Member = None):
-        """Kullanıcının seviyesini gösterir."""
-        member = member or ctx.author
-        level, xp, total_xp = await self._get_user_data(ctx.guild.id, member.id)
-        xp_needed = self._calculate_xp_for_level(level + 1)
-        progress = (xp / xp_needed) * 100 if xp_needed > 0 else 0
-        progress_bar = f"[{'█' * int(progress // 5)}{'─' * (20 - int(progress // 5))}] ({progress:.1f}%)"
+        """Bir üyenin seviye, XP ve sunucu sıralamasını gösterir."""
+        target = member or ctx.author
         
         async with self.db_pool.acquire() as conn:
+            user_data = await conn.fetchrow("SELECT level, xp, total_xp FROM users WHERE user_id = $1 AND guild_id = $2", target.id, ctx.guild.id)
+            if not user_data:
+                await ctx.send(f"{target.display_name} kullanıcısının henüz bir seviye verisi yok.")
+                return
+            
+            level, xp, total_xp = user_data['level'], user_data['xp'], user_data['total_xp']
             rank = await conn.fetchval(
                 "SELECT COUNT(*) + 1 FROM users WHERE guild_id = $1 AND total_xp > $2",
                 ctx.guild.id, total_xp
-            ) or "N/A"
+            ) or 1
 
-        level_role = None
-        level_role_name = "Yok"
-        level_role_map = self.config.get("level_roles", {})
-        member_role_ids = {role.id for role in member.roles}
-        
-        highest_level = -1
-        for level_threshold, role_id_str in level_role_map.items():
-            try:
-                level_threshold = int(level_threshold)
-                if level >= level_threshold and level_threshold > highest_level:
-                    role_id = int(role_id_str)
-                    if role_id in member_role_ids:
-                        role = ctx.guild.get_role(role_id)
-                        if role:
-                            level_role = role
-                            highest_level = level_threshold
-            except ValueError:
-                self.logger.error(f"Geçersiz seviye/rol ID: {level_threshold}/{role_id_str}")
-                continue
-        
-        if level_role:
-            level_role_name = level_role.name
-            embed_color = level_role.color if level_role.color.value != 0 else discord.Color.blue()
-        else:
-            embed_color = discord.Color.blue()
-            self.logger.info(f"{member.display_name} (ID: {member.id}) için seviye rolü bulunamadı (Seviye: {level})")
+        xp_needed = self._calculate_xp_for_level(level + 1)
+        progress = (xp / xp_needed) * 100
+        progress_bar = f"[{'█' * int(progress / 5)}{'─' * (20 - int(progress / 5))}]"
 
         embed = discord.Embed(
-            title=f"{member.display_name} Seviye Bilgisi",
-            color=embed_color
+            title=f"{target.display_name} Seviye Bilgisi",
+            color=discord.Color.gold()
         )
+        embed.set_thumbnail(url=target.display_avatar.url)
+        embed.add_field(name="Sıralama", value=f"#{rank}", inline=True)
         embed.add_field(name="Seviye", value=str(level), inline=True)
-        embed.add_field(name="XP", value=f"{xp}/{xp_needed}", inline=True)
         embed.add_field(name="Toplam XP", value=str(total_xp), inline=True)
-        embed.add_field(name="Sıralama", value=str(rank), inline=True)
-        embed.add_field(name="Seviye Rolü", value=level_role_name, inline=True)
-        embed.add_field(name="İlerleme", value=progress_bar, inline=False)
-        embed.set_thumbnail(url=member.avatar.url if member.avatar else None)
+        embed.add_field(
+            name="İlerleme",
+            value=f"{xp} / {xp_needed} XP\n{progress_bar} {progress:.1f}%",
+            inline=False
+        )
         await ctx.send(embed=embed)
 
-    @commands.command(name="lider")
+    @commands.command(name="lider", aliases=["leaderboard", "top"])
     async def leaderboard(self, ctx: commands.Context):
-        """Sunucudaki kullanıcıların XP sıralamasını gösterir."""
-        try:
-            async with self.db_pool.acquire() as conn:
-                # Top 10 kullanıcıyı toplam XP'ye göre sırala
-                rows = await conn.fetch(
-                    "SELECT user_id, total_xp, level FROM users WHERE guild_id = $1 ORDER BY total_xp DESC LIMIT 10",
-                    ctx.guild.id
-                )
-                if not rows:
-                    await ctx.send("⚠️ Bu sunucuda henüz sıralama yok!")
-                    return
+        """Sunucudaki en yüksek XP'ye sahip kullanıcıları listeler."""
+        async with self.db_pool.acquire() as conn:
+            top_users = await conn.fetch(
+                "SELECT user_id, level, total_xp FROM users WHERE guild_id = $1 ORDER BY total_xp DESC LIMIT 10",
+                ctx.guild.id
+            )
 
-                embed = discord.Embed(
-                    title="🏆 Liderlik Tablosu",
-                    color=discord.Color.gold(),
-                    timestamp=discord.utils.utcnow()
-                )
-                for index, row in enumerate(rows, 1):
-                    user_id = row['user_id']
-                    total_xp = row['total_xp']
-                    level = row['level']
-                    member = ctx.guild.get_member(user_id)
-                    username = member.display_name if member else f"ID: {user_id}"
-                    embed.add_field(
-                        name=f"{index}. {username}",
-                        value=f"Seviye: {level} | Toplam XP: {total_xp}",
-                        inline=False
-                    )
-                embed.set_footer(text=f"Sunucu: {ctx.guild.name}")
-                await ctx.send(embed=embed)
-                self.logger.info(f"Liderlik tablosu görüntülendi (S:{ctx.guild.id})")
-        except Exception as e:
-            self.logger.error(f"Liderlik tablosu hatası (S:{ctx.guild.id}): {e}")
-            await ctx.send("⚠️ Liderlik tablosu yüklenirken bir hata oluştu!")
+        if not top_users:
+            await ctx.send("Bu sunucuda henüz kimse sıralamaya girmemiş.")
+            return
 
-    @commands.command(name="kanalac")
-    @commands.has_permissions(manage_channels=True)
-    async def remove_blacklist_channel(self, ctx: commands.Context, channel: discord.TextChannel):
-        """Bir kanalı XP kara listesinden kaldırır."""
-        if channel.id in self.config["blacklisted_channels"]:
-            self.config["blacklisted_channels"].remove(channel.id)
-            self._save_config()
-            await ctx.send(f"✅ {channel.mention} artık XP kara listesinden çıkarıldı!")
-            self.logger.info(f"Kanal XP kara listesinden çıkarıldı: {channel.id} (S:{ctx.guild.id})")
-        else:
-            await ctx.send(f"❌ {channel.mention} zaten XP kara listesinde değil!")
+        embed = discord.Embed(
+            title=f"🏆 {ctx.guild.name} Liderlik Tablosu",
+            color=discord.Color.gold()
+        )
+        
+        description = []
+        for i, user_data in enumerate(top_users, 1):
+            member = ctx.guild.get_member(user_data['user_id'])
+            display_name = member.display_name if member else f"Bilinmeyen Üye (ID: {user_data['user_id']})"
+            description.append(
+                f"**{i}.** {display_name} - **Seviye {user_data['level']}** ({user_data['total_xp']} XP)"
+            )
+        
+        embed.description = "\n".join(description)
+        await ctx.send(embed=embed)
 
-    @commands.command(name="kanalengelle")
-    @commands.has_permissions(manage_channels=True)
-    async def blacklist_channel(self, ctx: commands.Context, channel: discord.TextChannel):
-        """Bir kanalı XP kazanımından kara listeye alır."""
-        if channel.id not in self.config["blacklisted_channels"]:
-            self.config["blacklisted_channels"].append(channel.id)
-            self._save_config()
-            await ctx.send(f"✅ {channel.mention} artık XP kazanımından kara listeye alındı!")
-            self.logger.info(f"Kanal XP kara listesine eklendi: {channel.id} (S:{ctx.guild.id})")
-        else:
-            await ctx.send(f"❌ {channel.mention} zaten XP kara listesinde!")
-
-    @commands.command(name="kapat")
-    @commands.is_owner()
-    async def shutdown(self, ctx: commands.Context):
-        """Botu güvenli bir şekilde kapatır (Sadece sahip kullanabilir)."""
-        await ctx.send("🔴 Bot kapatılıyor...")
-        self.logger.info("Bot sahibi tarafından kapatıldı.")
-        await self.bot.close()
-
-    @commands.command(name="restart")
-    @commands.is_owner()
-    async def restart(self, ctx: commands.Context):
-        """Botu yeniden başlatır (Sadece sahip kullanabilir)."""
-        await ctx.send("🔄 Bot yeniden başlatılıyor...")
-        self.logger.info("Bot sahibi tarafından yeniden başlatıldı.")
-        await self.bot.close()  # Botu kapat, ana script yeniden başlatabilir
-
-    @commands.command(name="seviyesifirla")
+    @commands.command(name="seviyesifirla", aliases=["levelreset"])
     @commands.has_permissions(manage_guild=True)
     async def reset_level(self, ctx: commands.Context, member: discord.Member):
-        """Bir üyenin XP ve seviyesini sıfırlar."""
-        try:
-            async with self.db_pool.acquire() as conn:
-                await conn.execute(
-                    "UPDATE users SET level = 0, xp = 0, total_xp = 0 WHERE user_id = $1 AND guild_id = $2",
-                    member.id, ctx.guild.id
-                )
-                await self._correct_member_level_roles(member, ctx.guild)
-                await ctx.send(f"✅ {member.mention} için XP ve seviye sıfırlandı!")
-                self.logger.info(f"{member.display_name} (ID: {member.id}) için seviye sıfırlandı (S:{ctx.guild.id})")
-        except Exception as e:
-            self.logger.error(f"Seviye sıfırlama hatası (K:{member.id}, S:{ctx.guild.id}): {e}")
-            await ctx.send("⚠️ Seviye sıfırlama başarısız oldu!")
+        """Bir üyenin seviyesini ve XP'sini tamamen sıfırlar."""
+        async with self.db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE users SET level = 0, xp = 0, total_xp = 0 WHERE user_id = $1 AND guild_id = $2",
+                member.id, ctx.guild.id
+            )
+        
+        await self._update_level_roles(member, 0)
+        await ctx.send(f"✅ {member.mention} kullanıcısının tüm seviye verileri sıfırlandı.")
+        self.logger.info(f"{ctx.author.display_name}, {member.display_name} kullanıcısının seviyesini sıfırladı.")
 
-    @commands.command(name="uptime")
-    @commands.is_owner()
-    async def uptime(self, ctx: commands.Context):
-        """Botun ne kadar süredir aktif olduğunu gösterir (Sadece Sahip)."""
-        uptime_seconds = discord.utils.utcnow().timestamp() - self.bot.start_time
-        days, remainder = divmod(int(uptime_seconds), 86400)
-        hours, remainder = divmod(remainder, 3600)
-        minutes, seconds = divmod(remainder, 60)
-        uptime_str = f"{days} gün, {hours} saat, {minutes} dakika, {seconds} saniye"
-        await ctx.send(f"🕒 Bot {uptime_str} süredir aktif!")
-        self.logger.info(f"Uptime komutu kullanıldı: {uptime_str}")
-
-    @commands.command(name="xpayar")
+    # --- YÖNETİCİ KOMUT GRUBU ---
+    @commands.group(name="seviyeayar", aliases=["levelsettings"], invoke_without_command=True)
     @commands.has_permissions(manage_guild=True)
-    async def set_xp_range(self, ctx: commands.Context, min_xp: int, max_xp: int):
-        """Mesajlar için XP aralığını ayarlar."""
-        if min_xp > 0 and max_xp > min_xp:
-            self.config["xp_range"]["min"] = min_xp
-            self.config["xp_range"]["max"] = max_xp
+    async def level_settings(self, ctx: commands.Context):
+        """Seviye sistemi ayarlarını yönetmek için ana komut."""
+        embed = discord.Embed(
+            title="Seviye Sistemi Ayarları",
+            description="Aşağıdaki alt komutları kullanarak seviye sistemini yapılandırabilirsiniz:",
+            color=discord.Color.gold()
+        )
+        embed.add_field(name=f"`{ctx.prefix}seviyeayar rolver <seviye> <@rol>`", value="Seviye ödül rolü belirler.", inline=False)
+        embed.add_field(name=f"`{ctx.prefix}seviyeayar rolkaldir <seviye>`", value="Bir seviye ödül rolünü kaldırır.", inline=False)
+        embed.add_field(name=f"`{ctx.prefix}seviyeayar rolyiginla <ac/kapat>`", value="Seviye rolleri yığılsın mı yoksa sadece en yükseği mi kalsın.", inline=False)
+        embed.add_field(name=f"`{ctx.prefix}seviyeayar kanalkapat <#kanal>`", value="Bir kanalda XP kazanımını kapatır.", inline=False)
+        embed.add_field(name=f"`{ctx.prefix}seviyeayar kanalac <#kanal>`", value="Bir kanalda XP kazanımını açar.", inline=False)
+        await ctx.send(embed=embed)
+
+    @level_settings.command(name="rolver")
+    @commands.has_permissions(manage_guild=True)
+    async def set_level_role(self, ctx: commands.Context, level: int, role: discord.Role):
+        if role.position >= ctx.guild.me.top_role.position:
+            await ctx.send(f"❌ '{role.name}' rolünü yönetemem. Lütfen botun rolünü bu rolün üzerine taşıyın.")
+            return
+        self.config["level_roles"][str(level)] = role.id
+        self._save_config()
+        await ctx.send(f"✅ Seviye **{level}** için ödül rolü **{role.name}** olarak ayarlandı.")
+
+    @level_settings.command(name="rolkaldir")
+    @commands.has_permissions(manage_guild=True)
+    async def remove_level_role(self, ctx: commands.Context, level: int):
+        if str(level) in self.config["level_roles"]:
+            del self.config["level_roles"][str(level)]
             self._save_config()
-            await ctx.send(f"✅ XP aralığı {min_xp}-{max_xp} olarak ayarlandı!")
-            self.logger.info(f"XP aralığı ayarlandı: {min_xp}-{max_xp} (S:{ctx.guild.id})")
+            await ctx.send(f"✅ Seviye **{level}** için ayarlanmış ödül rolü kaldırıldı.")
         else:
-            await ctx.send("❌ Minimum XP 0'dan büyük olmalı ve maksimum XP minimumdan büyük olmalı!")
+            await ctx.send(f"❌ Bu seviye için zaten bir ödül rolü ayarlanmamış.")
 
-    @commands.command(name="xpboost")
+    @level_settings.command(name="rolyiginla")
     @commands.has_permissions(manage_guild=True)
-    async def set_xp_boost(self, ctx: commands.Context, target: discord.Member, multiplier: float):
-        """Bir kullanıcıya veya role XP çarpanı ayarlar."""
-        if multiplier > 0:
-            self.config["xp_boosts"][str(target.id)] = multiplier
+    async def set_role_stacking(self, ctx: commands.Context, durum: str):
+        durum = durum.lower()
+        if durum in ["aç", "ac", "on", "true", "evet"]:
+            self.config["stack_roles"] = True
             self._save_config()
-            await ctx.send(f"✅ {target.mention} için XP çarpanı {multiplier}x olarak ayarlandı!")
-            self.logger.info(f"XP çarpanı ayarlandı: {target.id} -> {multiplier}x (S:{ctx.guild.id})")
-        else:
-            await ctx.send("❌ XP çarpanı 0'dan büyük olmalı!")
-
-    @commands.command(name="xpboostkaldir")
-    @commands.has_permissions(manage_guild=True)
-    async def remove_xp_boost(self, ctx: commands.Context, target: discord.Member):
-        """Bir kullanıcıdan XP çarpanını kaldırır."""
-        if str(target.id) in self.config["xp_boosts"]:
-            del self.config["xp_boosts"][str(target.id)]
+            await ctx.send("✅ Rol yığınlama **aktif**. Kullanıcılar kazandıkları tüm seviye rollerini koruyacak.")
+        elif durum in ["kapat", "off", "false", "hayir"]:
+            self.config["stack_roles"] = False
             self._save_config()
-            await ctx.send(f"✅ {target.mention} için XP çarpanı kaldırıldı!")
-            self.logger.info(f"XP çarpanı kaldırıldı: {target.id} (S:{ctx.guild.id})")
+            await ctx.send("✅ Rol yığınlama **devre dışı**. Kullanıcılar sadece ulaştıkları en yüksek seviye rolünü taşıyacak.")
         else:
-            await ctx.send(f"❌ {target.mention} için XP çarpanı zaten yok!")
-
-    @commands.command(name="xpekle")
-    @commands.has_permissions(manage_guild=True)
-    async def add_xp(self, ctx: commands.Context, member: discord.Member, amount: int):
-        """Belirli bir üyeye XP ekler."""
-        if amount > 0:
-            await self._update_user_xp(ctx.guild.id, member.id, amount, 1.0)
-            await ctx.send(f"✅ {member.mention} için {amount} XP eklendi!")
-            self.logger.info(f"{amount} XP eklendi: {member.id} (S:{ctx.guild.id})")
-        else:
-            await ctx.send("❌ XP miktarı 0'dan büyük olmalı!")
+            await ctx.send("❌ Geçersiz durum. Lütfen `ac` veya `kapat` kullanın.")
 
     async def cog_unload(self):
-        """Cog kaldırıldığında veritabanı bağlantısını kapat."""
+        """Cog kapatıldığında önbelleği veritabanına yaz ve bağlantıyı kapat."""
+        self.flush_xp_cache_to_db.cancel()
+        await self.flush_xp_cache_to_db()
         if self.db_pool:
             await self.db_pool.close()
-            self.logger.info("PostgreSQL veritabanı bağlantısı kapatıldı.")
+            self.logger.info("LevelingCog kaldırıldı, PostgreSQL bağlantısı kapatıldı.")
 
 async def setup(bot: commands.Bot):
+    """Bot'a LevelingCog'u ekler."""
     await bot.add_cog(LevelingCog(bot))
